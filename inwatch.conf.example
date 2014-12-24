@@ -1,0 +1,22 @@
+# Example inwatch configuration file
+
+# Set a watch on inwatch iteself and reload if it is modified.
+/bin/inwatch		IN_MODIFY	kill -s hup `pidof inwatch`
+/etc/inwatch.conf	IN_MODIFY	LOAD_CONF
+
+# Restart mysql when config is changed.
+/etc/my.cnf		IN_MODIFY	/etc/init.d/mysql restart	
+
+### RBLD stuff ###
+/bin/rbld		IN_MODIFY	kill -s hup `pidof rbld`
+
+# Watch RBLD config and specify command to reload daemon, note the use of
+# the SOCK command here.
+/etc/rbld.conf		IN_MODIFY|IN_CREATE_SELF SOCK RBLD LOAD_CONF /etc/rbld.conf
+
+# Additional inwatch config.  In this example we have a conf for all of 
+# the individual RBL lists that we are using in RBLD.
+/etc/rbld_lists.conf	IN_MODIFY|IN_CREATE_SELF	LOAD_CONF
+
+# Example rdld_lists.conf entry
+# /var/spool/blacklist IN_MODIFY|IN_CREATE_SELF SOCK RBLD LOAD_LIST /var/spool/blacklist
