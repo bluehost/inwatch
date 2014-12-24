@@ -1,0 +1,639 @@
+#!/usr/bin/perl -w
+
+##########################################################################
+## inwatch - Daemon to set inotify watches, and run commands upon events
+## or connect to a Unix Socket to perform actions.  For example, it can be
+## used in conjunction with RBLD (https://github.com/bluehost/rbld) to
+## watch RBL lists, and reload RBLD automatically when a list is updated. 
+## Copyright 2008, Bluehost, Inc.
+##
+## Authors and Contributers:
+##
+## Spencer Candland <spencer@bluehost.com>
+##
+## http://www.bluehost.com
+## https://github.com/bluehost/inwatch
+##
+###########################################################################
+##
+## This file is part of inwatch
+##
+## Rbld free software; you can redistribute it and/or modify
+## it under the terms of the GNU General Public License as published by
+## the Free Software Foundation; either version 2 of the License, or
+## (at your option) any later version.
+##
+## This program is distributed in the hope that it will be useful,
+## but WITHOUT ANY WARRANTY; without even the implied warranty of
+## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.See the
+## GNU General Public License for more details.
+##
+## You should have received a copy of the GNU General Public License
+## along with this program; if not, write to the Free Software
+## Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA02111-1307, USA.
+##
+###########################################################################
+
+###########################################################################
+## Please note that we break away from "pure" inotify flags with our use of
+## custom fake flags (see below), and the automatic inclusion of
+## IN_DELETE_SELF, the former exists because it was convenient, the latter
+## because I was tired of people complaining that inwatch didn't work
+## properly, so I gave up and made it behave the way they they thought it
+## was supposed to work....  I have faith that one day people will actually
+## attempt to understand the tools they use, in the meantime it was easier
+## to accommodate their misunderstandings.
+###########################################################################
+
+use strict;
+use warnings;
+
+use Data::Dumper;
+use Proc::PID::File;
+use Proc::Daemon;
+use Linux::Inotify2;
+use POSIX qw(WNOHANG _exit);
+use IO::Socket;
+
+my $conf_file = "/etc/inwatch.conf";
+my $log_file = "/var/log/inwatch.log"; # TODO, move to conf file
+my $timeout = 30;
+my $int = 1;
+my $DEBUG = 0;
+my %conf;
+my %child;
+my $lastwd;
+my $run_path = $0;
+
+# Set event masks, taken from inotify.h
+my %event_mask = (
+  "IN_ACCESS"		=> 0x00000001,	# File was accessed
+  "IN_MODIFY"		=> 0x00000002,	# File was modified
+  "IN_ATTRIB"		=> 0x00000004, 	# Metadata changed
+  "IN_CLOSE_WRITE"	=> 0x00000008,	# Writtable file was closed
+  "IN_CLOSE_NOWRITE"	=> 0x00000010,	# Unwrittable file closed
+  "IN_OPEN" 		=> 0x00000020,	# File was opened
+  "IN_MOVED_FROM"	=> 0x00000040,	# File was moved from X
+  "IN_MOVED_TO"		=> 0x00000080,	# File was moved to Y
+  "IN_CREATE"		=> 0x00000100,	# Subfile was created
+  "IN_DELETE"		=> 0x00000200,	# Subfile was deleted
+  "IN_DELETE_SELF"	=> 0x00000400,  # Self was deleted
+  "IN_MOVE_SELF"	=> 0x00000800,	# Self was moved
+
+# the following are legal events.  they are sent as needed to any watch and we catch them as errors
+  "IN_UNMOUNT"		=> 0x00002000,	# Backing fs was unmounted
+  "IN_Q_OVERFLOW"	=> 0x00004000,	# Event queued overflowed
+  "IN_IGNORED"		=> 0x00008000,	# File was ignored
+
+# special flags
+  "IN_ONLYDIR"		=> 0x01000000,	# only watch the path if it is a directory
+  "IN_DONT_FOLLOW"	=> 0x02000000,	# don't follow a sym link
+  "IN_MASK_ADD"		=> 0x20000000,	# add to the mask of an already existing watch
+  "IN_ISDIR"		=> 0x40000000,	# event occurred against dir
+  "IN_ONESHOT"		=> 0x80000000,	# only send event once
+
+# Custom FAKE flags, here for documentation.
+  #"IN_CREATE_SELF"	=> FAKE,  # Create file if it doesn't exist
+  #"IN_MISSING_RUN"	=> FAKE,  # If file is missing run command
+  #"IN_CLOSE"		=> FAKE,  # All close flags
+  #"IN_MOVE"		=> FAKE,  # All move flags
+  #"IN_ALL_EVENTS"	=> FAKE,  # All INOTIFY events
+
+);
+
+my @all = (
+  "IN_ACCESS",
+  "IN_MODIFY",
+  "IN_ATTRIB",
+  "IN_CLOSE_WRITE",
+  "IN_CLOSE_NOWRITE",
+  "IN_OPEN",
+  "IN_MOVED_FROM",
+  "IN_MOVED_TO",
+  "IN_DELETE",
+  "IN_CREATE",
+  "IN_DELETE_SELF",
+  "IN_MOVE_SELF",
+);
+
+
+# Convenient helper event
+foreach (@all) {
+  $event_mask{"IN_ALL_EVENTS"} |= $event_mask{$_};
+}
+
+# more helper events 
+$event_mask{"IN_CLOSE"} = ($event_mask{"IN_CLOSE_WRITE"} | $event_mask{"IN_CLOSE_NOWRITE"});	# close
+$event_mask{"IN_MOVE"}	= ($event_mask{"IN_MOVED_FROM"} | $event_mask{"IN_MOVED_TO"});		# move
+
+# specify internal commands
+my %inw = (
+  SOCK => \&sockd,
+  LOAD_EMAIL => \&load_email,
+  LOAD_CONF => \&load_conf,
+);
+
+# TODO, this really should be handled in a conf
+# Specify sockets for daemons that we want to send commands to
+my %daemon = (
+  "RBLD"  =>  {
+    "socket" => '/var/run/rbld.sock',
+    "bin" => '/bin/rbld',
+    "process" => 'rbld',
+  },
+);
+
+
+Proc::Daemon::Init();
+umask 0022;
+exit 1 if Proc::PID::File->running();
+
+open_log ();
+
+warn scalar(localtime).": [$$] Starting inwatch\n";
+
+$| = 1;
+$0 = "inwatch";
+
+# Catch signals
+my $sigset = POSIX::SigSet->new();
+POSIX::sigaction(&POSIX::SIGHUP, POSIX::SigAction->new('reload', $sigset, &POSIX::SA_NODEFER));
+POSIX::sigaction(&POSIX::SIGALRM, POSIX::SigAction->new('reload', $sigset, &POSIX::SA_NODEFER));
+POSIX::sigaction(&POSIX::SIGPIPE, POSIX::SigAction->new('reload', $sigset, &POSIX::SA_NODEFER));
+$SIG{CHLD} = \&reaper;
+$SIG{USR1} = \&dump;
+$SIG{USR2} = \&open_log;
+
+my $inotify = new Linux::Inotify2
+  or die "unable to create new inotify object: $!";
+
+# Set up watches on our daemon socket files
+foreach (keys %daemon) {
+  next unless (-e $daemon{$_}{"bin"});
+  # If the daemon is not running spawn it
+  unless (-e $daemon{$_}{socket}) {
+      warn scalar(localtime).": [$$] $_ is not running, spawning\n";
+      system("$daemon{$_}{bin}");
+      sleep 2;
+  }
+  # test the deaemon
+  sockd ("FAKE", "$_ INWATCH_TEST"); # TODO, hope your daemon is fine with this
+  logger ("Creating watch of ($daemon{$_}{socket})");
+  $conf{$daemon{$_}{socket}} = {
+    create => 0,
+    mrun => 0,
+    cfile => $run_path,
+    mask => $event_mask{"IN_DELETE_SELF"},
+    routine => \&run,
+    cmd => "kill -s hup `pidof $daemon{$_}{process}`; sleep 30",
+  };
+  create_watch ($daemon{$_}{socket});
+}
+
+load_conf($conf_file);
+
+# Wait for a inotify event
+while (1) {
+  $inotify->poll;
+}
+
+sub run {
+  my $e = shift;
+  my ($file, $cmd);
+
+  # If we are a inotify event run our command
+  if (ref($e)) {
+    return if (catch_error (\$e));
+    $file = $e->{w}->{name};
+    $cmd = $conf{$file}{cmd};
+  } elsif ($conf{$e}) { # If we have a conf create the watch
+    create_watch ($e);
+    return;
+  } else {  # Otherwise we were a manual command, so just execute
+    $file = $e;
+    $cmd = shift;
+  }
+
+  # Cancel ourselves so we don't conflict while operating, or generate additional events ourselves.
+  wipe_callback ($file, \$e);
+
+  return unless ($cmd);
+
+  my $pid;
+  $child{$pid} = $file if ($pid = fork);
+  unless ($pid) { # child
+    warn scalar(localtime).": [$$] Running $cmd\n";
+    $0 = "inwatch - running [".$cmd."]";
+    sleep 1;
+    {exec $cmd};
+    _exit(0);
+  }
+
+
+};
+
+sub load_conf {
+  my $e = shift;
+  my $file;
+  if (ref($e)) {
+    return if (catch_error (\$e));
+    logger ("Caught update to conf file $e->{w}->{name}");
+    $file = $e->{w}->{name};
+    # Give enough time to create new file if we were a delete,write operation.
+    sleep 1 if ($e->IN_DELETE_SELF);
+  } else {
+    $file = $e;
+  }
+
+  return unless (-e $file);
+  # Cancel ourselves so we don't conflict while operating, or generate additional events ourselves.
+  wipe_callback ($file, \$e);
+
+  # If file was reset wipe all watches
+  if (((stat("$file"))[7]) <= 1) {
+    foreach (keys %conf) {
+      if ($conf{$_}{cfile} eq $file) {
+        delete_watch ($_);
+      }
+    }
+    restore_callback ($file);
+    return;
+  }
+
+  my %nconf;
+  if (open (my $cnf, "<$file")) {
+    flock($cnf, 2);
+    while (<$cnf>) {
+      $_ =~ s/\s*\#.*//g;
+      chomp ($_);
+      next unless ($_);
+      my ($wfile, $events, $cmd) = split(/\s+/, $_, 3);
+      $nconf{$wfile}{cfile} = $file;
+      my @tmp = split(/\|/, $events);
+      foreach (@tmp) {
+        next if ($_ eq "IN_DELETE_SELF");  # We will add this ourselves anyway.
+        if ($_ eq "IN_CREATE_SELF") {      # Catch our fake flag and create the file.
+          $nconf{$wfile}{create} = 1;
+          next;
+        } elsif ($_ eq "IN_MISSING_RUN") {
+          $nconf{$wfile}{mrun} = 1;
+        }
+        # Make sure this is a valid flag
+        next unless (exists $event_mask{$_});
+        $nconf{$wfile}{mask} |= $event_mask{$_};
+      }
+      # Catch being deleted, this is so we can create a new watcher if we are deleted.
+      # It is common for editors to do this on write.  This makes IN_MODIFY work the
+      # way people expect it to.
+      $nconf{$wfile}{mask} |= $event_mask{"IN_DELETE_SELF"};
+      # Setup internal stuff
+      my ($int, $int_cmd) = split(/\s+/, $cmd, 2);
+      if (exists $inw{$int}) {
+        # Make sure we always have a command, even if we don't need it (for example on a LOAD_CONF)
+        $int_cmd = "FAKE" unless ($int_cmd);
+        $nconf{$wfile}{create} = 0 unless ($nconf{$wfile}{create});
+        $nconf{$wfile}{mrun} = 0 unless ($nconf{$wfile}{mrun});
+        $nconf{$wfile}{routine} = \&{$inw{$int}};
+        $nconf{$wfile}{cmd} = $int_cmd;
+      } else {
+        $nconf{$wfile}{routine} = \&run;
+        $nconf{$wfile}{cmd} = $cmd;
+      }
+
+      # See if there are conflicts or watch is already set
+      if (exists $conf{$wfile}) {
+        if ($conf{$wfile}{cfile} ne $file) {
+          warn scalar(localtime).": [$$] $wfile is already has a watch set by ".$conf{$wfile}{cfile}.", refusing to override.\n";
+          next;
+        }
+        my $diff = 0;
+        foreach (keys %{$nconf{$wfile}}) {
+          $diff = 1 if ($nconf{$wfile}{$_} ne $conf{$wfile}{$_});
+        }
+            
+        next unless ($diff == 1);
+        logger ("Config for $wfile in $file has changed, updating watch");
+        delete_watch ($wfile);
+      }
+
+      $conf{$wfile} = $nconf{$wfile};
+
+      if (exists $inw{$int}) {
+        # Avoid loop by making sure we are not ourselves.
+        # For example this currently happens on inwatch.conf.
+        if ($file ne $wfile) {
+          $inw{$int}->($wfile);
+        }
+      } else {
+        create_watch ($wfile);
+      }
+    }
+    flock($cnf, 8);
+    close ($cnf);
+    # Find entries that were removed
+    foreach my $wfile (keys %conf) {
+      next unless ($conf{$wfile}{cfile} eq $file);
+      unless (exists $nconf{$wfile}) {
+        logger ("Config for $wfile in $file was removed, deleting watch");
+        delete_watch ($wfile) unless (exists $nconf{$wfile});
+      }
+    }
+  } else {
+    warn scalar(localtime).": [$$] Unable to load conf ($file)\n";
+  }
+  restore_callback ($file);
+}
+
+sub sockd {
+  my $e = shift;
+  my ($file, $cmd);
+  # If we are a inotify event run our command
+  if (ref($e)) {
+    return if (catch_error (\$e));
+    $file = $e->{w}->{name};
+    $cmd = $conf{$file}{cmd};
+  } elsif ($conf{$e}) { # If we have a conf create the watch
+    create_watch ($e);
+    return;
+  } else {  # Otherwise we were a manual command, so just execute
+    $file = $e;
+    $cmd = shift;
+  }
+
+  # Cancel ourselves so we don't conflict while operating, or generate additional events ourselves.
+  wipe_callback ($file, \$e);
+
+  unless ($cmd) {
+    logger ("No command specified for socket call ($file).  Canceled any appropriate watch.");
+    return 0;
+  }
+
+  my ($sock_daemon, $sock_cmd) = split(/\s+/, $cmd, 2);
+
+  unless (exists $daemon{$sock_daemon}) {
+    logger ("Requested daemon $sock_daemon does not exist.  Canceled any appropriate watch.");
+    return 0;
+  }
+
+  my $pid;
+  $child{$pid} = $file if ($pid = fork);
+  unless ($pid) { # child
+    
+    # Run the command
+    my ($buffer, $data, $wbuffer);
+    warn scalar(localtime).": [$$] Sending $cmd\n";
+    # Stolen from infoc
+    eval {
+      my $sock = IO::Socket::UNIX->new($daemon{$sock_daemon}{socket}) or warn scalar(localtime).": [$$] Unable to connect to $sock_daemon: $!\n";
+      # If daemon is not running spawn it.
+      if (!$sock and $< == 0) {
+        warn scalar(localtime).": Unable to connect to $sock_daemon!  Attmpting to spawn, then try again\n";
+        system("$daemon{$sock_daemon}{bin}");
+        sleep 2;
+        $sock = IO::Socket::UNIX->new($daemon{$sock_daemon}{socket});
+      }
+      syswrite($sock, "$sock_cmd\n", length("$sock_cmd\n"));
+      $data = $buffer while sysread($sock, $buffer, 8192);
+      $sock->shutdown(2);
+    };
+
+    # Log any output from daemon
+    warn scalar(localtime).": [$$] Caught output from $sock_daemon: $data\n" if ($data);
+    
+    sleep 1;
+    _exit(0);
+
+  }
+
+}
+
+sub create_watch {
+  my $file = shift;
+  return if ($file eq "FAKE");
+  unless (-e "$file") {
+    if ($conf{$file}{mrun}) {  # Handle IN_MISSING_RUN
+      run ("FAKE", "$conf{$file}{cmd}");
+    } elsif ($conf{$file}{create}) {  # Handle IN_CREATE_SELF
+      logger ("Creating $file");
+      open (CRT, "+>>$file");
+      close (CRT);
+    }
+  }
+  # on writes sometimes the file does not exist for a moment or so
+  # because of editor move, write, del dance.  Probably a crappy
+  # way to deal with this, but it seems to work.
+  sleep 1 unless (-e $file);
+  if (-e $file) {
+    logger ("Creating watch for $file");
+    my $watch = $inotify->watch ($file, $conf{$file}{mask}, $conf{$file}{routine});
+    $conf{$file}{watch} = $watch->{wd};
+    $conf{$file}{inode} = (stat "$file")[1];
+    logger ("Created watch for $file ($watch->{wd})");
+    return 1;
+  } else {
+    warn scalar(localtime).": [$$] Sorry can't create watch on non-existant file $file\n";
+  }
+  return 0;
+}
+
+sub delete_watch {
+  my $e = shift;
+
+  if (ref($e)) {
+    return if (catch_error (\$e));
+    logger ("Deleting watch on ".$$e->{w}->name." ($$e->{w}->{wd})");
+    $lastwd = $$e->{w}->{wd};
+    $$e->{w}->cancel;
+    delete $conf{$$e->{w}->name};
+  } else {
+    logger ("Deleting watch on $e ($conf{$e}{watch})");
+    if (exists $inotify->{w}->{$conf{$e}{watch}}) {
+      $lastwd = $conf{$e}{watch};
+      $inotify->{w}->{$conf{$e}{watch}}->cancel;
+    }
+    delete $conf{$e};
+  }
+}
+
+sub cancel_watch {
+  my $e = shift;
+  if (ref($e)) {
+    return if (catch_error (\$e));
+    logger ("Canceling watch on ".$$e->{w}->name." ($conf{$$e->{w}->name}{watch})");
+    $lastwd = $$e->{w}->{wd};
+    $$e->{w}->cancel;
+    $conf{$$e->{w}->name}{watch} = 0;
+  } else {
+    return unless (exists $conf{$e});
+    unless ($conf{$e}{watch}) {
+      warn scalar(localtime).": [$$] Can't cancel watch on $e when it doesn't exist\n";
+      return;
+    }
+    logger ("Canceling watch on $e ($conf{$e}{watch})");
+    $lastwd = $conf{$e}{watch};
+    $inotify->{w}->{$conf{$e}{watch}}->cancel;
+    $conf{$e}{watch} = 0;
+    # Extra debug info to see if this happens when called from catch_in_wipe
+    # before child returns and attempts to restore watch
+    warn scalar(localtime).": [$$] Canceled watch on $e ($conf{$e}{watch})\n";
+  }
+}
+
+sub wipe_callback {
+  my $file = shift;
+  my $e = shift;
+  return if ($file eq "FAKE");
+  # Detect if we really need a cancel instead
+  if (ref($$e)) {
+    return if (catch_error (\$$e));
+    if ($$e->IN_DELETE_SELF || $$e->IN_MOVE_SELF) {
+      cancel_watch ($file);
+      return;
+    }
+  }
+  return unless (exists $conf{$file});
+  return unless ($conf{$file}{watch});
+  logger ("Wiping callback on $file");
+  $inotify->{w}->{$conf{$file}{watch}}->{cb} = \&catch_in_wipe;
+}
+
+sub restore_callback {
+  my $file = shift;
+  return if ($file eq "FAKE");
+  # Call a create if this is not a valid restore
+  return create_watch($file) unless ($conf{$file}{watch});
+  # If we are still the same file just restore the watch
+  my $inode = (stat "$file")[1];
+  if ($inode == $conf{$file}{inode}) {
+    logger ("Restoring callback on $file");
+    unless ($inotify->{w}->{$conf{$file}{watch}}->{cb} = $conf{$file}{routine}) {
+      warn scalar(localtime).": [$$] Yikes, unable to restore callback for $file, $!\n";
+    }
+    return;
+  }
+
+  # Yikes, the inode changed, reset the watch
+  cancel_watch($file);
+  # Handle hooks if file doesn't exist at all
+  unless ($inode) {
+    if ($conf{$file}{mrun}) {  # Handle IN_MISSING_RUN
+      run ("FAKE", "$conf{$file}{cmd}");
+    } elsif ($conf{$file}{create}) {  # Handle IN_CREATE_SELF
+      logger ("Creating $file");
+      open (CRT, "+>>$file");
+      close (CRT);
+    }
+  }
+  return create_watch($file);
+}
+
+# If we get a event in wipe status, mostly want to log 
+# and ignore.  But if it is a error, delete, or move,
+# we have to cancel the watch.
+sub catch_in_wipe {
+  my $e = shift;
+  # Should never happen
+  return unless (ref($e));
+  return if (catch_error (\$e));
+  if ($e->IN_DELETE_SELF || $e->IN_MOVE_SELF) {
+    warn scalar(localtime).": [$$] Canceling watch on ".$e->{w}->{name}." from inside catch_in_wipe.\n";
+    # Handle case where child returned and reset watch after we caught this event.
+    if ($inotify->{w}->{$conf{$e->{w}->{name}}{watch}}->{cb} != \&catch_in_wipe) {
+      warn scalar(localtime).": [$$] Watch was enabled again on ".$e->{w}->{name}."while we were in catch_in_wipe, resetting watch.\n";
+      cancel_watch ($e->{w}->{name});
+      create_watch ($e->{w}->{name});
+      return;
+    }
+    cancel_watch ($e->{w}->{name});
+    return;
+  }
+}
+
+# Catch inotify errors
+sub catch_error {
+  my $e = ${(shift)};
+  if ($e->IN_Q_OVERFLOW) {
+    warn scalar(localtime).": [$$] Inotify queue overflowed, reloading...\n";
+    reload();
+  }
+
+  if ($e->IN_UNMOUNT) {
+    warn scalar(localtime).": [$$] Mount point for ".$e->{w}->{name}." disappeared or file was removed ($!).  Attempting to create watch again.\n";
+    cancel_watch(\$e);
+    unless (create_watch($e->{w}->{name})) {
+      warn scalar(localtime).": [$$] Recreate for ".$e->{w}->{name}." failed.  Removing watch.\n";
+      delete_watch (\$e);
+      return;
+    }
+  }
+
+  if ($e->IN_IGNORED) {
+    # From inotify man:
+    #     IN_IGNORED      Watch was removed explicitly (inotify_rm_watch())
+    #                     or automatically (file was deleted, or
+    #                     file system was unmounted)
+    # If this was triggered on a wd that we just reused we want to ignore it
+    # otherwise this is a real error and we need to remove the watch.
+    if ($lastwd == $e->{w}->{wd}) {
+      logger ("Reused old watch descriptor, ignoring IN_IGNORE!!");
+      return;
+    }
+    warn scalar(localtime).": [$$] Ouch, caught a IN_IGNORE for no known reason on $e->{w}->{name} ($e->{w}->{wd}), removing watch.\n";
+    delete_watch (\$e);
+    return;
+  }
+  log_event (\$e);
+}
+
+# Log inotify events 
+sub log_event {
+  my $e = ${(shift)};
+  foreach (keys %event_mask) {
+    warn scalar(localtime).": [$$] $_ (".$e->{w}->{name}.")\n" if $e->$_;
+  }
+}
+
+sub logger {
+  return unless ($DEBUG);
+  my $msg = shift;
+  warn scalar(localtime).": [$$] $msg\n";
+}
+
+sub dump {
+  warn scalar(localtime).": [$$] (\$inotify):\n" . Dumper ($inotify);
+  warn scalar(localtime).": [$$] (\$conf):\n" . Dumper (%conf);
+  warn scalar(localtime).": [$$] (\$child):\n" . Dumper (%child);
+  $SIG{USR1} = \&dump;
+}
+
+sub reload {
+  warn scalar(localtime).": [$$] $0 reloading...\n";
+  exit if fork;
+  sleep 5;
+  exec "$run_path" or die "exec: $!";
+}
+
+sub reaper {
+  my $ouch = 0;
+  while ((my $pid = waitpid( -1, WNOHANG)) > 0) {
+    # Activate watch again
+    if ($child{$pid}) {
+      if ($conf{$child{$pid}}) {
+        warn scalar(localtime).": [$$] Command ($conf{$child{$pid}}{cmd}) complete ($pid), setting up watch again on $child{$pid}\n";
+        restore_callback ($child{$pid});
+      }
+      delete $child{$pid};
+    } else {
+      warn scalar(localtime).": [$$] OUCH! Reaped a child ($pid) that we know nothing about, forcing reload as we are clearly missing something.\n";
+      $ouch = 1;
+    }
+  }
+  alarm 2 if ($ouch);
+}
+
+sub open_log {
+  close (STDERR);
+  open STDERR, ">>$log_file";
+  chmod 0600, $log_file;
+  $SIG{USR2} = \&open_log;
+}
